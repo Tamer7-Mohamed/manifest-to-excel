@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>تحويل المانيفست إلى Excel</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1c1f24; --muted:#6b7280; --accent:#2563eb; --border:#d9dde3; --ok:#15803d; --err:#b91c1c; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#14161a; --card:#1d2025; --text:#e8eaed; --muted:#9aa3af; --accent:#5b8def; --border:#343a43; --ok:#4ade80; --err:#f87171; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:system-ui,"Segoe UI",Tahoma,sans-serif; display:flex; justify-content:center; padding:32px 16px; }
+  main { width:100%; max-width:560px; }
+  h1 { font-size:1.4rem; margin:0 0 4px; }
+  p.sub { color:var(--muted); margin:0 0 20px; font-size:.9rem; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:20px; }
+  #drop { border:2px dashed var(--border); border-radius:10px; padding:36px 16px; text-align:center; cursor:pointer; transition:.15s; }
+  #drop.over, #drop:hover { border-color:var(--accent); }
+  #drop.disabled { opacity:.5; pointer-events:none; }
+  #status { margin-top:16px; font-size:.92rem; min-height:1.4em; }
+  .ok { color:var(--ok); } .err { color:var(--err); white-space:pre-wrap; direction:ltr; text-align:left; font-size:.8rem; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:10px 18px; font-size:1rem; cursor:pointer; margin-top:12px; }
+  progress { width:100%; margin-top:10px; }
+  .note { color:var(--muted); font-size:.8rem; margin-top:16px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>📄 تحويل المانيفست إلى Excel</h1>
+  <p class="sub">كل المعالجة بتتم في المتصفح عندك، والملف ما بيترفعش على أي سيرفر.</p>
+
+  <div class="card">
+    <div id="drop" class="disabled">
+      <div id="dropText">جاري تجهيز البرنامج (أول مرة بياخد حوالي نص دقيقة)...</div>
+      <input id="file" type="file" accept="application/pdf" hidden>
+    </div>
+    <progress id="prog" style="display:none"></progress>
+    <div id="status"></div>
+    <div id="dl"></div>
+  </div>
+  <p class="note">لازم الـ PDF يكون فيه نص حقيقي (مش صورة ممسوحة).</p>
+</main>
+
+<script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const status = (msg, cls="") => { $("status").className = cls; $("status").textContent = msg; };
+let pyodide = null;
+
+async function init() {
+  try {
+    $("prog").style.display = "block";
+    pyodide = await loadPyodide();
+    status("بحمّل المكتبات...");
+    await pyodide.loadPackage(["micropip", "pandas", "openpyxl", "pillow", "cryptography"]);
+    const micropip = pyodide.pyimport("micropip");
+    await micropip.install(["charset-normalizer", "pdfminer.six", "pdfplumber"], { deps: false });
+
+    // pypdfium2 بتستخدمها pdfplumber لرسم الصور بس، ومش محتاجينها هنا
+    await pyodide.runPythonAsync(`
+import sys
+from unittest.mock import MagicMock
+for m in ["pypdfium2", "pypdfium2.raw", "pypdfium2._helpers", "pypdfium2._helpers.page", "pypdfium2._helpers.bitmap"]:
+    sys.modules.setdefault(m, MagicMock())
+`);
+
+    const src = await (await fetch("manifest_to_excel.py")).text();
+    pyodide.FS.writeFile("manifest_to_excel.py", src);
+    await pyodide.runPythonAsync(`
+import io
+import pandas as pd
+from pyodide.ffi import to_js
+import manifest_to_excel as M
+
+def convert(data):
+    blocks = M.read_blocks(io.BytesIO(bytes(data)))
+    if not blocks:
+        raise ValueError("ما لقيتش بوالص في الملف. اتأكد إنه PDF بنص حقيقي.")
+    summaries, details = [], []
+    for b in blocks:
+        s, d = M.parse_block(b)
+        summaries.append(s)
+        details.extend(d)
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        pd.DataFrame(summaries).to_excel(xw, sheet_name="Manifest", index=False)
+        pd.DataFrame(details).to_excel(xw, sheet_name="Containers", index=False)
+        for ws in xw.book.worksheets:
+            for col in ws.columns:
+                w = max(len(str(c.value or "")) for c in col)
+                ws.column_dimensions[col[0].column_letter].width = min(w + 2, 60)
+    return to_js(buf.getvalue()), len(summaries), len(details)
+`);
+    $("prog").style.display = "none";
+    $("drop").classList.remove("disabled");
+    $("dropText").textContent = "اضغط هنا أو اسحب ملف الـ PDF";
+    status("");
+  } catch (e) {
+    $("prog").style.display = "none";
+    status("فشل تحميل البرنامج:\n" + e, "err");
+  }
+}
+
+async function handle(file) {
+  if (!file || !pyodide) return;
+  $("dl").innerHTML = "";
+  $("drop").classList.add("disabled");
+  $("prog").style.display = "block";
+  status("جاري الاستخراج: " + file.name);
+  try {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    pyodide.globals.set("pdf_data", bytes);
+    const res = await pyodide.runPythonAsync("convert(pdf_data.to_py())");
+    const [xlsx, nBL, nCont] = res.toJs();
+    res.destroy?.();
+    const blob = new Blob([xlsx], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+    const url = URL.createObjectURL(blob);
+    const name = file.name.replace(/\.pdf$/i, "") + ".xlsx";
+    status(`تم: ${nBL} بوليصة، ${nCont} حاوية`, "ok");
+    $("dl").innerHTML = `<a href="${url}" download="${name}"><button>⬇️ تحميل ${name}</button></a>`;
+  } catch (e) {
+    status(String(e), "err");
+  } finally {
+    $("prog").style.display = "none";
+    $("drop").classList.remove("disabled");
+  }
+}
+
+const drop = $("drop"), input = $("file");
+drop.addEventListener("click", () => input.click());
+input.addEventListener("change", () => handle(input.files[0]));
+drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("over"); });
+drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+drop.addEventListener("drop", e => { e.preventDefault(); drop.classList.remove("over"); handle(e.dataTransfer.files[0]); });
+
+init();
+</script>
+</body>
+</html>
