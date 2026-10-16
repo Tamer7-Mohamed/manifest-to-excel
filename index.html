@@ -47,15 +47,22 @@
 const $ = id => document.getElementById(id);
 const status = (msg, cls="") => { $("status").className = cls; $("status").textContent = msg; };
 let pyodide = null;
+let step = "";
 
 async function init() {
   try {
     $("prog").style.display = "block";
+    step = "تحميل Pyodide";
     pyodide = await loadPyodide();
     status("بحمّل المكتبات...");
-    await pyodide.loadPackage(["micropip", "pandas", "openpyxl", "pillow", "cryptography"]);
-    const micropip = pyodide.pyimport("micropip");
-    await micropip.install(["charset-normalizer", "pdfminer.six", "pdfplumber"], { deps: false });
+    step = "تحميل pandas / pillow / cryptography";
+    await pyodide.loadPackage(["micropip", "pandas", "pillow", "cryptography"]);
+    step = "تثبيت openpyxl و pdfplumber من PyPI";
+    await pyodide.runPythonAsync(`
+import micropip
+await micropip.install("openpyxl")
+await micropip.install(["charset-normalizer", "pdfminer.six", "pdfplumber"], deps=False)
+`);
 
     // pypdfium2 بتستخدمها pdfplumber لرسم الصور بس، ومش محتاجينها هنا
     await pyodide.runPythonAsync(`
@@ -65,7 +72,17 @@ for m in ["pypdfium2", "pypdfium2.raw", "pypdfium2._helpers", "pypdfium2._helper
     sys.modules.setdefault(m, MagicMock())
 `);
 
-    const src = await (await fetch("manifest_to_excel.py")).text();
+    step = "تحميل ملف manifest_to_excel.py من الموقع";
+    let src = null, errs = [];
+    for (const name of ["manifest_to_excel.txt", "manifest_to_excel.py"]) {
+      try {
+        const r = await fetch(name + "?v=" + Date.now());
+        if (r.ok) { src = await r.text(); break; }
+        errs.push(name + " (HTTP " + r.status + ")");
+      } catch (e) { errs.push(name + " (" + e.message + ")"); }
+    }
+    if (src === null) throw new Error("مش قادر أحمّل السكريبت: " + errs.join("، "));
+    step = "تشغيل السكريبت";
     pyodide.FS.writeFile("manifest_to_excel.py", src);
     await pyodide.runPythonAsync(`
 import io
@@ -98,7 +115,7 @@ def convert(data):
     status("");
   } catch (e) {
     $("prog").style.display = "none";
-    status("فشل تحميل البرنامج:\n" + e, "err");
+    status("فشل في خطوة: " + step + "\n" + e, "err");
   }
 }
 
